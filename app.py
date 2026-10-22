@@ -11,6 +11,62 @@ from store import engine, init, fingerprint_dossier
 from receipts import verify_receipt
 
 app = FastAPI()
+BASE_URL = "https://a2a-invoice-agent-ga3.onrender.com"
+
+AGENT_CARD = {
+    "name": "Safe AI Mailroom Agent",
+    "description": (
+        "Reads mailroom dossiers, proposes exactly one safe action, "
+        "and records only cryptographically verified signed receipts."
+    ),
+    "version": "1.0.0",
+    "protocolVersion": "0.3.0",
+    "url": f"{BASE_URL}/mailroom",
+    "capabilities": {
+        "streaming": False,
+        "pushNotifications": False,
+        "stateTransitionHistory": False
+    },
+    "defaultInputModes": ["application/json"],
+    "defaultOutputModes": ["application/json"],
+    "skills": [
+        {
+            "id": "mailroom_action_gate",
+            "name": "Safe mailroom action gate",
+            "description": (
+                "Classifies a dossier and returns one allowed mailroom "
+                "action with minimal evidence, then accepts signed receipts."
+            ),
+            "tags": ["mailroom", "safety", "receipts", "a2a"],
+            "examples": [
+                "Propose a safe action for a customer email dossier.",
+                "Verify a signed receipt and record its outcome."
+            ],
+            "inputModes": ["application/json"],
+            "outputModes": ["application/json"]
+        }
+    ],
+    "securitySchemes": {},
+    "security": []
+}
+
+
+@app.get("/.well-known/agent-card.json")
+async def agent_card():
+    return JSONResponse(
+        status_code=200,
+        content=AGENT_CARD,
+        media_type="application/json",
+    )
+
+
+@app.get("/.well-known/agent.json")
+async def agent_card_alias():
+    return JSONResponse(
+        status_code=200,
+        content=AGENT_CARD,
+        media_type="application/json",
+    )
 init()
 
 
