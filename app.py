@@ -61,7 +61,7 @@ async def agent_card():
     return JSONResponse(
         status_code=200,
         content=AGENT_CARD,
-        media_type="application/json",
+        media_type="application/a2a+json",
     )
 
 
@@ -70,7 +70,7 @@ async def agent_card_alias():
     return JSONResponse(
         status_code=200,
         content=AGENT_CARD,
-        media_type="application/json",
+        media_type="application/a2a+json",
     )
 
 
@@ -124,7 +124,7 @@ async def a2a_message_send(request: Request):
                     "message": "Parse error"
                 }
             },
-            media_type="application/json",
+            media_type="application/a2a+json",
         )
 
     rpc_id = body.get("id")
@@ -196,7 +196,7 @@ async def a2a_message_send(request: Request):
                 "task": task
             }
         },
-        media_type="application/json",
+        media_type="application/a2a+json",
     )
 
 
