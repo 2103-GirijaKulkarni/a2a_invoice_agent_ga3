@@ -3,5 +3,7 @@ uvicorn[standard]
 pydantic
 pynacl
 cryptography
+sqlalchemy
+psycopg[binary]
 pytest
 httpx
