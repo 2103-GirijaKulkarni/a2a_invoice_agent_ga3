@@ -1,113 +1,116 @@
+import json
 import uuid
 from datetime import datetime, timezone
 
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from sqlalchemy import text
+
+from canonical import sha256_hex, proposal_digest
+from schemas import validate_propose, PROFILE
+from decide import decide, new_call_id
+from store import engine, init, fingerprint_dossier
+from receipts import verify_receipt
+
+app = FastAPI()
+init()
+
+BASE_URL = "https://a2a-invoice-agent-ga3.onrender.com"
+
+AGENT_CARD = {
+    "name": "Safe AI Mailroom Agent",
+    "description": (
+        "Reads mailroom dossiers, proposes exactly one safe action, "
+        "and records only cryptographically verified signed receipts."
+    ),
+    "version": "1.0.0",
+    "protocolVersion": "0.3.0",
+    "preferredTransport": "JSONRPC",
+    "url": f"{BASE_URL}/mailroom",
+    "capabilities": {
+        "streaming": False,
+        "pushNotifications": False,
+        "stateTransitionHistory": False
+    },
+    "defaultInputModes": ["application/json"],
+    "defaultOutputModes": ["application/json"],
+    "skills": [
+        {
+            "id": "mailroom_action_gate",
+            "name": "Safe mailroom action gate",
+            "description": (
+                "Classifies a dossier and returns one allowed mailroom "
+                "action with minimal evidence, then accepts signed receipts."
+            ),
+            "tags": ["mailroom", "safety", "receipts", "a2a"],
+            "examples": [
+                "Propose a safe action for a customer email dossier.",
+                "Verify a signed receipt and record its outcome."
+            ],
+            "inputModes": ["application/json"],
+            "outputModes": ["application/json"]
+        }
+    ],
+    "securitySchemes": {},
+    "security": []
+}
+
+@app.get("/.well-known/agent-card.json")
+async def agent_card():
+    return JSONResponse(
+        status_code=200,
+        content=AGENT_CARD,
+        media_type="application/json",
+    )
+
+
+@app.get("/.well-known/agent.json")
+async def agent_card_alias():
+    return JSONResponse(
+        status_code=200,
+        content=AGENT_CARD,
+        media_type="application/json",
+    )
+
+def error(message, status_code=400):
+    return JSONResponse(
+        status_code=status_code,
+        content={"error": message},
+    )
+
+
+def jsonrpc_error(rpc_id, code, message):
+    return JSONResponse(
+        status_code=200,
+        content={
+            "jsonrpc": "2.0",
+            "id": rpc_id,
+            "error": {
+                "code": code,
+                "message": message
+            }
+        },
+        media_type="application/json",
+    )
+
 
 def extract_a2a_text(params):
-    message = params.get("message", {})
-    parts = message.get("parts", [])
+    message = params.get("message") or {}
+    parts = message.get("parts") or []
 
     texts = []
+
     for part in parts:
         if isinstance(part, dict) and part.get("kind") == "text":
             texts.append(part.get("text", ""))
 
     return "\n".join(texts).strip()
 
-
 @app.post("/mailroom/message:send")
 async def a2a_message_send(request: Request):
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse(
-            status_code=400,
-            content={
-                "jsonrpc": "2.0",
-                "id": None,
-                "error": {
-                    "code": -32700,
-                    "message": "Parse error"
-                }
-            },
-            media_type="application/json",
-        )
+    ...
 
-    rpc_id = body.get("id")
-    method = body.get("method")
-    params = body.get("params") or {}
-
-    if method not in ("message/send", "SendMessage"):
-        return JSONResponse(
-            status_code=200,
-            content={
-                "jsonrpc": "2.0",
-                "id": rpc_id,
-                "error": {
-                    "code": -32601,
-                    "message": "Method not found"
-                }
-            },
-            media_type="application/json",
-        )
-
-    incoming_message = params.get("message") or {}
-    context_id = incoming_message.get("contextId") or str(uuid.uuid4())
-    user_text = extract_a2a_text(params)
-
-    reply_text = (
-        "Safe AI Mailroom Agent is ready. "
-        "Send a mailroom dossier through the mailroom propose endpoint; "
-        "I will return one safe action and wait for a signed receipt."
-    )
-
-    if user_text:
-        reply_text = (
-            "Received your message. This A2A interface provides agent "
-            "discovery and status; mailroom dossiers are processed through "
-            "the mailroom propose and commit operations."
-        )
-
-    now = datetime.now(timezone.utc).isoformat()
-
-    result = {
-        "kind": "task",
-        "id": str(uuid.uuid4()),
-        "contextId": context_id,
-        "status": {
-            "state": "completed",
-            "timestamp": now,
-            "message": {
-                "kind": "message",
-                "messageId": str(uuid.uuid4()),
-                "role": "agent",
-                "parts": [
-                    {
-                        "kind": "text",
-                        "text": reply_text
-                    }
-                ]
-            }
-        },
-        "artifacts": [
-            {
-                "artifactId": str(uuid.uuid4()),
-                "name": "mailroom-agent-status",
-                "parts": [
-                    {
-                        "kind": "text",
-                        "text": reply_text
-                    }
-                ]
-            }
-        ]
-    }
-
-    return JSONResponse(
-        status_code=200,
-        content={
-            "jsonrpc": "2.0",
-            "id": rpc_id,
-            "result": result
-        },
-        media_type="application/json",
-    )
+@app.post("/mailroom")
+@app.post("/mailroom/")
+async def mailroom(request: Request):
+    ...
