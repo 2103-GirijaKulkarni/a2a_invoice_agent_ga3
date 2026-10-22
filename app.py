@@ -2,18 +2,19 @@ import json
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from sqlalchemy import text
 
 from canonical import sha256_hex, proposal_digest
 from schemas import validate_propose, PROFILE
 from decide import decide, new_call_id
-from store import init, db, fingerprint_dossier
+from store import engine, init, fingerprint_dossier
 from receipts import verify_receipt
 
 app = FastAPI()
 init()
 
 
-def error(message: str, status_code: int = 400):
+def error(message, status_code=400):
     return JSONResponse(
         status_code=status_code,
         content={"error": message},
@@ -21,6 +22,7 @@ def error(message: str, status_code: int = 400):
 
 
 @app.post("/mailroom")
+@app.post("/mailroom/")
 async def mailroom(request: Request):
     try:
         body = await request.json()
@@ -41,7 +43,7 @@ async def mailroom(request: Request):
     return error("Unknown operation", 400)
 
 
-async def handle_propose(body: dict):
+async def handle_propose(body):
     try:
         dossiers = validate_propose(body)
     except ValueError as exc:
@@ -50,18 +52,18 @@ async def handle_propose(body: dict):
     evaluation_id = body["evaluationId"]
     input_digest = sha256_hex(dossiers)
 
-    with db() as conn:
+    with engine.begin() as conn:
         existing = conn.execute(
-            """
-            SELECT input_digest, propose_response
-            FROM evaluations
-            WHERE evaluation_id = ?
-            """,
-            (evaluation_id,),
+            text("""
+                SELECT input_digest, propose_response
+                FROM evaluations
+                WHERE evaluation_id = :evaluation_id
+            """),
+            {"evaluation_id": evaluation_id},
         ).fetchone()
 
-        if existing is not None:
-            if existing["input_digest"] != input_digest:
+        if existing:
+            if existing.input_digest != input_digest:
                 return error(
                     "Same evaluationId used with changed dossier content",
                     409,
@@ -69,26 +71,26 @@ async def handle_propose(body: dict):
 
             return JSONResponse(
                 status_code=200,
-                content=json.loads(existing["propose_response"]),
+                content=json.loads(existing.propose_response),
             )
 
         proposals = []
 
         for dossier in dossiers:
-            content_fingerprint = fingerprint_dossier(dossier)
+            fingerprint = fingerprint_dossier(dossier)
 
             cached = conn.execute(
-                """
-                SELECT proposal_json, call_id
-                FROM stable_cache
-                WHERE content_fingerprint = ?
-                """,
-                (content_fingerprint,),
+                text("""
+                    SELECT proposal_json, call_id
+                    FROM stable_cache
+                    WHERE content_fingerprint = :fingerprint
+                """),
+                {"fingerprint": fingerprint},
             ).fetchone()
 
-            if cached is not None:
-                proposal = json.loads(cached["proposal_json"])
-                call_id = cached["call_id"]
+            if cached:
+                proposal = json.loads(cached.proposal_json)
+                call_id = cached.call_id
             else:
                 decision = decide(dossier)
                 call_id = new_call_id()
@@ -103,35 +105,41 @@ async def handle_propose(body: dict):
                 }
 
                 conn.execute(
-                    """
-                    INSERT OR IGNORE INTO stable_cache
-                    (content_fingerprint, proposal_json, call_id)
-                    VALUES (?, ?, ?)
-                    """,
-                    (
-                        content_fingerprint,
-                        json.dumps(proposal, separators=(",", ":")),
-                        call_id,
-                    ),
+                    text("""
+                        INSERT INTO stable_cache
+                        (content_fingerprint, proposal_json, call_id)
+                        VALUES
+                        (:fingerprint, :proposal_json, :call_id)
+                    """),
+                    {
+                        "fingerprint": fingerprint,
+                        "proposal_json": json.dumps(
+                            proposal, separators=(",", ":")
+                        ),
+                        "call_id": call_id,
+                    },
                 )
 
-            current_proposal_digest = proposal_digest(proposal)
+            digest = proposal_digest(proposal)
+            proposal_json = json.dumps(proposal, separators=(",", ":"))
 
             conn.execute(
-                """
-                INSERT INTO proposals
-                (evaluation_id, dossier_id, content_fingerprint,
-                 call_id, proposal_json, proposal_digest)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    evaluation_id,
-                    dossier["dossierId"],
-                    content_fingerprint,
-                    call_id,
-                    json.dumps(proposal, separators=(",", ":")),
-                    current_proposal_digest,
-                ),
+                text("""
+                    INSERT INTO proposals
+                    (evaluation_id, dossier_id, content_fingerprint,
+                     call_id, proposal_json, proposal_digest)
+                    VALUES
+                    (:evaluation_id, :dossier_id, :fingerprint,
+                     :call_id, :proposal_json, :proposal_digest)
+                """),
+                {
+                    "evaluation_id": evaluation_id,
+                    "dossier_id": dossier["dossierId"],
+                    "fingerprint": fingerprint,
+                    "call_id": call_id,
+                    "proposal_json": proposal_json,
+                    "proposal_digest": digest,
+                },
             )
 
             proposals.append(proposal)
@@ -145,24 +153,30 @@ async def handle_propose(body: dict):
         }
 
         conn.execute(
-            """
-            INSERT INTO evaluations
-            (evaluation_id, input_digest, verifier_jwk,
-             propose_response, committed, commit_response)
-            VALUES (?, ?, ?, ?, 0, NULL)
-            """,
-            (
-                evaluation_id,
-                input_digest,
-                json.dumps(body["receiptVerifier"], separators=(",", ":")),
-                json.dumps(response, separators=(",", ":")),
-            ),
+            text("""
+                INSERT INTO evaluations
+                (evaluation_id, input_digest, verifier_jwk,
+                 propose_response, committed, commit_response)
+                VALUES
+                (:evaluation_id, :input_digest, :verifier_jwk,
+                 :propose_response, FALSE, NULL)
+            """),
+            {
+                "evaluation_id": evaluation_id,
+                "input_digest": input_digest,
+                "verifier_jwk": json.dumps(
+                    body["receiptVerifier"], separators=(",", ":")
+                ),
+                "propose_response": json.dumps(
+                    response, separators=(",", ":")
+                ),
+            },
         )
 
         return JSONResponse(status_code=200, content=response)
 
 
-async def handle_commit(body: dict):
+async def handle_commit(body):
     evaluation_id = body.get("evaluationId")
     input_digest = body.get("inputDigest")
     receipts = body.get("receipts")
@@ -176,40 +190,43 @@ async def handle_commit(body: dict):
     if not isinstance(receipts, list) or not receipts:
         return error("Missing or invalid receipts", 400)
 
-    with db() as conn:
+    with engine.begin() as conn:
         evaluation = conn.execute(
-            """
-            SELECT input_digest, verifier_jwk, committed, commit_response
-            FROM evaluations
-            WHERE evaluation_id = ?
-            """,
-            (evaluation_id,),
+            text("""
+                SELECT input_digest, verifier_jwk, committed, commit_response
+                FROM evaluations
+                WHERE evaluation_id = :evaluation_id
+            """),
+            {"evaluation_id": evaluation_id},
         ).fetchone()
 
-        if evaluation is None:
+        if not evaluation:
             return error("Unknown evaluationId", 400)
 
-        if evaluation["input_digest"] != input_digest:
+        if evaluation.input_digest != input_digest:
             return error("inputDigest does not match stored evaluation", 400)
 
-        if evaluation["committed"]:
+        if evaluation.committed:
             return JSONResponse(
                 status_code=200,
-                content=json.loads(evaluation["commit_response"]),
+                content=json.loads(evaluation.commit_response),
             )
 
-        stored_proposals = {}
-        for row in conn.execute(
-            """
-            SELECT call_id, proposal_json, proposal_digest
-            FROM proposals
-            WHERE evaluation_id = ?
-            """,
-            (evaluation_id,),
-        ):
-            stored_proposals[row["call_id"]] = {
-                "proposal": json.loads(row["proposal_json"]),
-                "proposal_digest": row["proposal_digest"],
+        stored = {}
+
+        rows = conn.execute(
+            text("""
+                SELECT call_id, proposal_json, proposal_digest
+                FROM proposals
+                WHERE evaluation_id = :evaluation_id
+            """),
+            {"evaluation_id": evaluation_id},
+        ).fetchall()
+
+        for row in rows:
+            stored[row.call_id] = {
+                "proposal": json.loads(row.proposal_json),
+                "proposal_digest": row.proposal_digest,
             }
 
         receipt_call_ids = []
@@ -228,15 +245,13 @@ async def handle_commit(body: dict):
         if len(receipt_call_ids) != len(set(receipt_call_ids)):
             return error("Duplicate receipt callId", 400)
 
-        if set(receipt_call_ids) != set(stored_proposals.keys()):
+        if set(receipt_call_ids) != set(stored.keys()):
             return error(
-                "Receipts do not exactly match stored proposals",
-                400,
+                "Receipts do not exactly match stored proposals", 400
             )
 
-        verifier_jwk = json.loads(evaluation["verifier_jwk"])
+        verifier_jwk = json.loads(evaluation.verifier_jwk)
 
-        # Verify every signature before recording any outcome.
         for receipt in receipts:
             try:
                 verify_receipt(body, receipt, verifier_jwk)
@@ -247,19 +262,20 @@ async def handle_commit(body: dict):
 
         for receipt in receipts:
             call_id = receipt["callId"]
-            stored = stored_proposals[call_id]
-            proposal = stored["proposal"]
+            item = stored[call_id]
+            proposal = item["proposal"]
 
             if receipt.get("dossierId") != proposal["dossierId"]:
-                return error("Receipt dossierId does not match proposal", 400)
+                return error(
+                    "Receipt dossierId does not match proposal", 400
+                )
 
             if receipt.get("action") != proposal["action"]:
                 return error("Receipt action does not match proposal", 400)
 
-            if receipt.get("proposalDigest") != stored["proposal_digest"]:
+            if receipt.get("proposalDigest") != item["proposal_digest"]:
                 return error(
-                    "Receipt proposalDigest does not match proposal",
-                    400,
+                    "Receipt proposalDigest does not match proposal", 400
                 )
 
             accepted = receipt.get("accepted")
@@ -268,16 +284,21 @@ async def handle_commit(body: dict):
                 return error("Receipt accepted must be boolean", 400)
 
             conn.execute(
-                """
-                INSERT OR REPLACE INTO receipts
-                (evaluation_id, call_id, receipt_json)
-                VALUES (?, ?, ?)
-                """,
-                (
-                    evaluation_id,
-                    call_id,
-                    json.dumps(receipt, separators=(",", ":")),
-                ),
+                text("""
+                    INSERT INTO receipts
+                    (evaluation_id, call_id, receipt_json)
+                    VALUES
+                    (:evaluation_id, :call_id, :receipt_json)
+                    ON CONFLICT (evaluation_id, call_id)
+                    DO UPDATE SET receipt_json = EXCLUDED.receipt_json
+                """),
+                {
+                    "evaluation_id": evaluation_id,
+                    "call_id": call_id,
+                    "receipt_json": json.dumps(
+                        receipt, separators=(",", ":")
+                    ),
+                },
             )
 
             outcomes.append(
@@ -300,16 +321,18 @@ async def handle_commit(body: dict):
         }
 
         conn.execute(
-            """
-            UPDATE evaluations
-            SET committed = 1,
-                commit_response = ?
-            WHERE evaluation_id = ?
-            """,
-            (
-                json.dumps(response, separators=(",", ":")),
-                evaluation_id,
-            ),
+            text("""
+                UPDATE evaluations
+                SET committed = TRUE,
+                    commit_response = :commit_response
+                WHERE evaluation_id = :evaluation_id
+            """),
+            {
+                "commit_response": json.dumps(
+                    response, separators=(",", ":")
+                ),
+                "evaluation_id": evaluation_id,
+            },
         )
 
         return JSONResponse(status_code=200, content=response)
