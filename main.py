@@ -1,3 +1,4 @@
+import asyncpg
 import hashlib
 import json
 import os
@@ -162,7 +163,7 @@ def require_a2a_headers(request: Request):
 
     content_type = request.headers.get("content-type", "").split(";")[0].strip()
 
-    if content_type not in {A2A_JSON, "application/json"}:
+    if content_type != A2A_JSON:
         raise ValueError(f"Content-Type must be {A2A_JSON}")
 
 
