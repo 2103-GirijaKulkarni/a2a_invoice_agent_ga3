@@ -219,8 +219,4 @@ def decide_package(package: dict) -> dict:
 
 
 async def ai_decide(package: dict) -> dict:
-    """
-    Local deterministic decision engine.
-    No API key, external model, or network call is required.
-    """
     return decide_package(package)
