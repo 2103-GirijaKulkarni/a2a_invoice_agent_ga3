@@ -157,22 +157,22 @@ def require_a2a_headers(request: Request):
     if request.headers.get("a2a-version") != "1.0":
         raise ValueError("A2A-Version must be 1.0")
 
-    # GET requests have no body, so do not require Content-Type.
-    if request.method.upper() != "POST":
-        return
+    if request.url.path.endswith("/message:send"):
+        content_type = request.headers.get("content-type", "").split(";")[0].strip()
 
-    content_type = request.headers.get("content-type", "").split(";")[0].strip()
-
-    if content_type != A2A_JSON:
-        raise ValueError(f"Content-Type must be {A2A_JSON}")
+        if content_type != A2A_JSON:
+            raise ValueError(f"Content-Type must be {A2A_JSON}")
 
 
 def task_response(task: dict) -> dict:
     return {
+        "kind": "task",
         "id": task["taskId"],
         "contextId": task["contextId"],
         "history": task["history"],
-        "status": {"state": task["state"]},
+        "status": {
+            "state": task["state"],
+        },
         "artifacts": task["artifacts"],
     }
 
@@ -355,6 +355,7 @@ async def message_send(request: Request):
         proposal_artifact = {
             "parts": [
                 {
+                    "kind": "data",
                     "mediaType": PROPOSALS_MEDIA_TYPE,
                     "data": {
                         "batchId": batch_id,
@@ -557,6 +558,7 @@ async def handle_result_continuation(
                 {
                     "parts": [
                         {
+                            "kind": "data",
                             "mediaType": RECEIPTS_MEDIA_TYPE,
                             "data": {
                                 "batchId": task["batchId"],
@@ -644,13 +646,16 @@ async def list_tasks(request: Request):
             SELECT *
             FROM tasks
             WHERE owner_hash = $1
-            ORDER BY created_at DESC
+            ORDER BY updated_at DESC
             """,
             owner,
         )
 
     return JSONResponse(
-        content={"tasks": [public_task(row) for row in rows]},
+        content={
+            "tasks": [public_task(row) for row in rows],
+            "nextPageToken": "",
+        },
         media_type=A2A_JSON,
     )
 
