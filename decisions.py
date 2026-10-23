@@ -130,6 +130,7 @@ def choose_action(package: dict) -> tuple[str, list[str]]:
             "within autonomous authority" in text
             or "within delegated authority" in text
         )
+        and "no prior payment" in text
         and "already paid" not in text
         and "duplicate" not in text
         and "pending" not in text
