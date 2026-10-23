@@ -20,7 +20,6 @@ async def init_db():
     )
 
     async with _pool.acquire() as conn:
-        # Create the table for fresh databases.
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS tasks (
@@ -38,7 +37,6 @@ async def init_db():
             """
         )
 
-        # Migrate an older table that lacks message_id.
         await conn.execute(
             """
             ALTER TABLE tasks
@@ -46,7 +44,6 @@ async def init_db():
             """
         )
 
-        # Backfill old rows so the unique index can be created.
         await conn.execute(
             """
             UPDATE tasks
@@ -55,7 +52,6 @@ async def init_db():
             """
         )
 
-        # Make message_id non-null for new rows.
         await conn.execute(
             """
             ALTER TABLE tasks
@@ -63,14 +59,12 @@ async def init_db():
             """
         )
 
-        # Remove an incompatible older index, if present.
         await conn.execute(
             """
             DROP INDEX IF EXISTS tasks_owner_message_uq;
             """
         )
 
-        # Create the correct idempotency index.
         await conn.execute(
             """
             CREATE UNIQUE INDEX IF NOT EXISTS tasks_owner_message_id_uq
