@@ -30,30 +30,24 @@ def cache_key_for_package(package: dict) -> str:
 
 
 def extract_refs(text: str) -> list[str]:
-    """
-    Extract bracketed references such as [DOC-12 p.3] or [LEDGER-7].
-    """
     return re.findall(r"\[[^\[\]]{2,200}\]", text)
 
 
-def get_text(package: Any) -> str:
-    """
-    Convert the whole package into searchable text, including nested fields.
-    """
+def package_text(package: Any) -> str:
     return canonical_json(package)
 
 
 def find_amount_minor(package: dict) -> int:
-    for key in ("amountMinor", "amount_minor", "amount"):
-        value = package.get(key)
+    direct_keys = ("amountMinor", "amount_minor", "amount")
 
+    for key in direct_keys:
+        value = package.get(key)
         if isinstance(value, (int, float)):
             return int(value)
 
-    # Look one level deep for common invoice objects.
     for value in package.values():
         if isinstance(value, dict):
-            for key in ("amountMinor", "amount_minor", "amount"):
+            for key in direct_keys:
                 if isinstance(value.get(key), (int, float)):
                     return int(value[key])
 
@@ -75,12 +69,8 @@ def find_field(package: dict, keys: list[str]) -> str:
 
 
 def choose_action(package: dict) -> tuple[str, list[str]]:
-    """
-    Decision order matters:
-    duplicate -> conflict -> hold -> approval -> settle.
-    """
-    text = get_text(package).lower()
-    refs = extract_refs(get_text(package))
+    text = package_text(package).lower()
+    refs = extract_refs(package_text(package))
 
     duplicate_signals = [
         "already paid",
@@ -94,6 +84,7 @@ def choose_action(package: dict) -> tuple[str, list[str]]:
         "records conflict",
         "material conflict",
         "conflicting records",
+        "material records conflict",
         "amount mismatch",
         "invoice number mismatch",
         "vendor mismatch",
@@ -112,19 +103,10 @@ def choose_action(package: dict) -> tuple[str, list[str]]:
         "outside autonomous authority",
         "exceeds autonomous authority",
         "above autonomous authority",
-        "requires approval",
-        "approval required",
         "outside delegated authority",
         "exceeds delegated authority",
-    ]
-
-    settle_signals = [
-        "reconciled",
-        "within autonomous authority",
-        "within delegated authority",
-        "valid",
-        "no prior payment",
-        "no duplicate",
+        "requires approval",
+        "approval required",
     ]
 
     def has_any(signals: list[str]) -> bool:
@@ -142,35 +124,49 @@ def choose_action(package: dict) -> tuple[str, list[str]]:
     if has_any(approval_signals):
         return "request_approval", refs
 
-    if has_any(settle_signals):
+    settlement_is_proven = (
+        "reconciled" in text
+        and (
+            "within autonomous authority" in text
+            or "within delegated authority" in text
+        )
+        and "already paid" not in text
+        and "duplicate" not in text
+        and "pending" not in text
+        and "awaiting" not in text
+        and "conflict" not in text
+        and "mismatch" not in text
+        and "exceeds" not in text
+        and "outside" not in text
+    )
+
+    if settlement_is_proven:
         return "settle_invoice", refs
 
-    # Safe default: do not settle uncertain invoices.
     return "hold_invoice", refs
 
 
-def build_rationale(action: str, invoice_number: str, refs: list[str]) -> str:
+def build_rationale(
+    action: str,
+    invoice_number: str,
+    refs: list[str],
+) -> str:
     ref_text = ", ".join(refs[:3]) if refs else "the decisive package evidence"
-
-    rationale = (
-        f"Choose {action} for invoice {invoice_number}. "
-        f"The decisive package evidence is {ref_text}. "
-    )
 
     explanations = {
         "settle_invoice": (
-            "The invoice is valid, reconciled, and within autonomous authority, "
-            "with no indication of a prior payment for the same commercial invoice."
+            "The invoice is reconciled and within autonomous authority, with no "
+            "indication of a prior payment for the same commercial invoice."
         ),
         "request_approval": (
-            "The invoice appears commercially valid but falls outside the "
-            "delegated autonomous authority, so approval is required before settlement."
+            "The invoice appears commercially valid but falls outside delegated "
+            "autonomous authority, so approval is required before settlement."
         ),
         "hold_invoice": (
             "Payment must pause until the stated verification is completed."
         ),
         "reject_duplicate": (
-            "The same commercial invoice has already been paid, so a further "
+            "The same commercial invoice has already been paid, so another "
             "payment would be a duplicate."
         ),
         "open_exception": (
@@ -179,17 +175,20 @@ def build_rationale(action: str, invoice_number: str, refs: list[str]) -> str:
         ),
     }
 
-    rationale += explanations.get(action, "")
+    rationale = (
+        f"Choose {action} for invoice {invoice_number}. "
+        f"The decisive package evidence is {ref_text}. "
+        f"{explanations.get(action, '')}"
+    )
+
     return rationale[:1500]
 
 
 def decide_package(package: dict) -> dict:
     action, refs = choose_action(package)
 
-    # Keep only three decisive references.
     evidence_refs = refs[:3]
 
-    # This fallback should not normally trigger, but it keeps the schema valid.
     while len(evidence_refs) < 3:
         evidence_refs.append("[EVIDENCE-UNRESOLVED]")
 
@@ -220,7 +219,7 @@ def decide_package(package: dict) -> dict:
 
 async def ai_decide(package: dict) -> dict:
     """
-    No external model is required.
-    This is the local decision engine used for every package.
+    Local deterministic decision engine.
+    No API key, external model, or network call is required.
     """
     return decide_package(package)
