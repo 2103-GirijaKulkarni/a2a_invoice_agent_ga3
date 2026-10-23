@@ -156,6 +156,10 @@ def require_a2a_headers(request: Request):
     if request.headers.get("a2a-version") != "1.0":
         raise ValueError("A2A-Version must be 1.0")
 
+    # GET requests have no body, so do not require Content-Type.
+    if request.method.upper() != "POST":
+        return
+
     content_type = request.headers.get("content-type", "").split(";")[0].strip()
 
     if content_type not in {A2A_JSON, "application/json"}:
