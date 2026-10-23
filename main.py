@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 import uuid
+from contextlib import asynccontextmanager
 from typing import Any
 
 from dotenv import load_dotenv
@@ -10,7 +11,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from db import init_db, pool
+from db import database_lifespan, pool
 from decisions import (
     RECEIPTS_MEDIA_TYPE,
     RESULTS_MEDIA_TYPE,
@@ -26,19 +27,32 @@ PROPOSALS_MEDIA_TYPE = "application/vnd.ga5.invoice-action-proposals+json"
 
 BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
 
-app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+TERMINAL_STATES = {
+    "TASK_STATE_COMPLETED",
+    "TASK_STATE_CANCELED",
+    "TASK_STATE_FAILED",
+    "TASK_STATE_REJECTED",
+}
 
 
-@app.on_event("startup")
-async def startup():
-    await init_db()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    async with database_lifespan(app):
+        yield
+
+
+app = FastAPI(
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
+    lifespan=lifespan,
+)
 
 
 @app.middleware("http")
 async def a2a_content_type_middleware(request: Request, call_next):
     response = await call_next(request)
 
-    # Required for every successful A2A response, including the Agent Card.
     if 200 <= response.status_code < 300:
         response.headers["Content-Type"] = A2A_JSON
         response.headers["Cache-Control"] = "no-store"
@@ -126,10 +140,6 @@ def get_bearer(request: Request) -> str | None:
 
 
 def owner_hash(token: str) -> str:
-    """
-    Every distinct Bearer token is a distinct principal.
-    Do not compare the grader token with a local shared secret.
-    """
     return hashlib.sha256(token.encode()).hexdigest()
 
 
@@ -148,7 +158,6 @@ def require_a2a_headers(request: Request):
 
     content_type = request.headers.get("content-type", "").split(";")[0].strip()
 
-    # Accept the required A2A media type and ordinary JSON input.
     if content_type not in {A2A_JSON, "application/json"}:
         raise ValueError(f"Content-Type must be {A2A_JSON}")
 
@@ -173,6 +182,10 @@ def find_part(parts: list, media_type: str) -> dict | None:
         if part.get("mediaType") == media_type:
             return part
     return None
+
+
+def message_fingerprint(message: dict) -> str:
+    return hashlib.sha256(canonical_json(message).encode()).hexdigest()
 
 
 @app.get("/.well-known/agent-card.json")
@@ -252,31 +265,34 @@ async def message_send(request: Request):
     if not message_id:
         return error(400, "INVALID_REQUEST", "message.messageId is required.")
 
-    message_hash = hashlib.sha256(
-        canonical_json(message).encode()
-    ).hexdigest()
-
+    message_hash = message_fingerprint(message)
     db = await pool()
 
     async with db.acquire() as conn:
         existing = await conn.fetchrow(
             """
-            SELECT task_json
+            SELECT task_json, message_hash
             FROM tasks
-            WHERE owner_hash = $1 AND message_hash = $2
+            WHERE owner_hash = $1 AND message_id = $2
             """,
             owner,
-            message_hash,
+            message_id,
         )
 
         if existing:
+            if existing["message_hash"] != message_hash:
+                return error(
+                    409,
+                    "IDEMPOTENCY_CONFLICT",
+                    "messageId was reused with different semantic content.",
+                )
+
             return JSONResponse(
                 content={"task": json.loads(existing["task_json"])},
                 media_type=A2A_JSON,
             )
 
         parts = message.get("parts") or []
-
         batch_part = find_part(parts, BATCH_MEDIA_TYPE)
         result_part = find_part(parts, RESULTS_MEDIA_TYPE)
 
@@ -285,6 +301,7 @@ async def message_send(request: Request):
                 conn=conn,
                 owner=owner,
                 message=message,
+                message_hash=message_hash,
                 result_part=result_part,
             )
 
@@ -299,16 +316,15 @@ async def message_send(request: Request):
         batch_id = data.get("batchId")
         packages = data.get("packages") or []
 
-        if not batch_id or not isinstance(packages, list):
+        if not batch_id or not isinstance(packages, list) or not packages:
             return error(
                 400,
                 "INVALID_REQUEST",
-                "batchId and packages are required.",
+                "batchId and a non-empty packages array are required.",
             )
 
         task_id = f"task_{uuid.uuid4().hex}"
         context_id = f"context_{uuid.uuid4().hex}"
-
         proposals = []
 
         for package in packages:
@@ -367,9 +383,10 @@ async def message_send(request: Request):
                     batch_id,
                     state,
                     task_json,
+                    message_id,
                     message_hash
                 )
-                VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7)
+                VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8)
                 """,
                 task_id,
                 context_id,
@@ -377,18 +394,26 @@ async def message_send(request: Request):
                 batch_id,
                 task["state"],
                 task_json,
+                message_id,
                 message_hash,
             )
         except asyncpg.UniqueViolationError:
             existing = await conn.fetchrow(
                 """
-                SELECT task_json
+                SELECT task_json, message_hash
                 FROM tasks
-                WHERE owner_hash = $1 AND message_hash = $2
+                WHERE owner_hash = $1 AND message_id = $2
                 """,
                 owner,
-                message_hash,
+                message_id,
             )
+
+            if existing and existing["message_hash"] != message_hash:
+                return error(
+                    409,
+                    "IDEMPOTENCY_CONFLICT",
+                    "messageId was reused with different semantic content.",
+                )
 
             return JSONResponse(
                 content={"task": json.loads(existing["task_json"])},
@@ -405,12 +430,14 @@ async def handle_result_continuation(
     conn,
     owner: str,
     message: dict,
+    message_hash: str,
     result_part: dict,
 ):
     task_id = message.get("taskId")
     context_id = message.get("contextId")
     data = result_part.get("data") or {}
     batch_id = data.get("batchId")
+    message_id = message.get("messageId")
 
     if not task_id:
         return error(400, "INVALID_REQUEST", "taskId is required.")
@@ -428,7 +455,11 @@ async def handle_result_continuation(
         )
 
         if not row:
-            return error(404, "TASK_NOT_FOUND", "Task not found.")
+            return error(
+                403,
+                "TASK_FORBIDDEN",
+                "Task is not accessible to this principal.",
+            )
 
         task = json.loads(row["task_json"])
 
@@ -437,6 +468,20 @@ async def handle_result_continuation(
 
         if batch_id and batch_id != task["batchId"]:
             return error(409, "BATCH_MISMATCH", "Batch does not match task.")
+
+        if message_id:
+            if task.get("lastResultMessageId") == message_id:
+                if task.get("lastResultMessageHash") == message_hash:
+                    return JSONResponse(
+                        content={"task": task_response(task)},
+                        media_type=A2A_JSON,
+                    )
+
+                return error(
+                    409,
+                    "IDEMPOTENCY_CONFLICT",
+                    "Result messageId was reused with different content.",
+                )
 
         if task["state"] != "TASK_STATE_INPUT_REQUIRED":
             return error(
@@ -451,6 +496,7 @@ async def handle_result_continuation(
         }
 
         executions = []
+        invalid = False
 
         for result in data.get("results", []):
             package_id = result.get("packageId")
@@ -463,29 +509,41 @@ async def handle_result_continuation(
             proposal = proposal_map.get(key)
 
             if not proposal:
-                continue
+                invalid = True
+                break
 
-            if outcome != "ACCEPTED":
-                continue
+            if outcome not in {"ACCEPTED", "REJECTED"}:
+                invalid = True
+                break
 
-            if not receipt_nonce:
-                continue
+            if outcome == "ACCEPTED":
+                if not receipt_nonce:
+                    invalid = True
+                    break
 
-            if package_id in task["executedPackageIds"]:
-                continue
+                if package_id in task["executedPackageIds"]:
+                    invalid = True
+                    break
 
-            executions.append(
-                {
-                    "packageId": proposal["packageId"],
-                    "actionId": proposal["actionId"],
-                    "action": proposal["action"],
-                    "receiptNonce": receipt_nonce,
-                    "facts": proposal["facts"],
-                    "evidenceRefs": proposal["evidenceRefs"],
-                }
+                executions.append(
+                    {
+                        "packageId": proposal["packageId"],
+                        "actionId": proposal["actionId"],
+                        "action": proposal["action"],
+                        "receiptNonce": receipt_nonce,
+                        "facts": proposal["facts"],
+                        "evidenceRefs": proposal["evidenceRefs"],
+                    }
+                )
+
+                task["executedPackageIds"].append(package_id)
+
+        if invalid:
+            return error(
+                409,
+                "INVALID_CONTINUATION",
+                "Result continuation does not match the stored task or proposal.",
             )
-
-            task["executedPackageIds"].append(package_id)
 
         task["history"].append(message)
 
@@ -503,7 +561,10 @@ async def handle_result_continuation(
                     ]
                 }
             )
-            task["state"] = "TASK_STATE_COMPLETED"
+
+        task["state"] = "TASK_STATE_COMPLETED"
+        task["lastResultMessageId"] = message_id
+        task["lastResultMessageHash"] = message_hash
 
         await conn.execute(
             """
@@ -524,32 +585,35 @@ async def handle_result_continuation(
     )
 
 
-async def load_owned_task(conn, owner: str, task_id: str):
-    return await conn.fetchrow(
-        """
-        SELECT *
-        FROM tasks
-        WHERE task_id = $1 AND owner_hash = $2
-        """,
-        task_id,
-        owner,
-    )
-
-
 @app.get("/a2a/tasks/{task_id}")
 async def get_task(task_id: str, request: Request):
     try:
         owner = require_auth(request)
+        require_a2a_headers(request)
     except PermissionError:
         return error(401, "UNAUTHENTICATED", "Authentication required.")
+    except ValueError as exc:
+        return error(400, "INVALID_REQUEST", str(exc))
 
     db = await pool()
 
     async with db.acquire() as conn:
-        row = await load_owned_task(conn, owner, task_id)
+        row = await conn.fetchrow(
+            """
+            SELECT *
+            FROM tasks
+            WHERE task_id = $1 AND owner_hash = $2
+            """,
+            task_id,
+            owner,
+        )
 
     if not row:
-        return error(404, "TASK_NOT_FOUND", "Task not found.")
+        return error(
+            403,
+            "TASK_FORBIDDEN",
+            "Task is not accessible to this principal.",
+        )
 
     return JSONResponse(
         content=public_task(row),
@@ -561,8 +625,11 @@ async def get_task(task_id: str, request: Request):
 async def list_tasks(request: Request):
     try:
         owner = require_auth(request)
+        require_a2a_headers(request)
     except PermissionError:
         return error(401, "UNAUTHENTICATED", "Authentication required.")
+    except ValueError as exc:
+        return error(400, "INVALID_REQUEST", str(exc))
 
     db = await pool()
 
@@ -587,8 +654,11 @@ async def list_tasks(request: Request):
 async def cancel_task(task_id: str, request: Request):
     try:
         owner = require_auth(request)
+        require_a2a_headers(request)
     except PermissionError:
         return error(401, "UNAUTHENTICATED", "Authentication required.")
+    except ValueError as exc:
+        return error(400, "INVALID_REQUEST", str(exc))
 
     db = await pool()
 
@@ -606,18 +676,15 @@ async def cancel_task(task_id: str, request: Request):
             )
 
             if not row:
-                return error(404, "TASK_NOT_FOUND", "Task not found.")
+                return error(
+                    403,
+                    "TASK_FORBIDDEN",
+                    "Task is not accessible to this principal.",
+                )
 
             task = json.loads(row["task_json"])
 
-            terminal_states = {
-                "TASK_STATE_COMPLETED",
-                "TASK_STATE_CANCELED",
-                "TASK_STATE_FAILED",
-                "TASK_STATE_REJECTED",
-            }
-
-            if task["state"] in terminal_states:
+            if task["state"] in TERMINAL_STATES:
                 return error(409, "TASK_TERMINAL", "Task is already terminal.")
 
             task["state"] = "TASK_STATE_CANCELED"
