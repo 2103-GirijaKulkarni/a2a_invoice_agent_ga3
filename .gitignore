@@ -1,37 +1,5 @@
-# Python
 __pycache__/
 *.py[cod]
-*.pyo
-
-# Virtual environments
 .venv/
 venv/
-env/
-
-# Secrets
 .env
-.env.*
-*.pem
-*.key
-
-# Runtime data
-mailroom.db
-mailroom.db-journal
-*.db
-*.sqlite
-*.sqlite3
-
-# Test artifacts
-.pytest_cache/
-.coverage
-htmlcov/
-
-# Local test inputs
-propose.json
-changed.json
-
-# OS/editor
-.DS_Store
-Thumbs.db
-.vscode/
-.idea/
